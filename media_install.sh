@@ -1,9 +1,9 @@
 #!/bin/bash
 # shellcheck shell=bash
 #
-# 媒体服务器 Docker 容器一键安装脚本
+# 媒体服务器 Docker 容器一键安装脚本  v2.01
 # 支持: qBittorrent / Transmission / iYUUPlus / MoviePilot V2 (+PostgreSQL/Redis) / Vertex / Emby / Jellyfin / Plex
-#
+# 功能: 一键安装 | 容器升级（数据无损）
 # ——————————————————————————————————————————————————————————————————————————————————
 
 # ——————————————————————————————————————————————————————————————————————————————————
@@ -360,6 +360,9 @@ function select_containers() {
     printf "  ${Green}%2d${Font}) %s\n" "$i" "切换镜像源（当前: ${mirror_label}）"
     local mirror_opt=$i
     ((i++))
+    printf "  ${Green}%2d${Font}) %s\n" "$i" "升级已安装容器（数据无损）"
+    local upgrade_opt=$i
+    ((i++))
     echo -e "  ${Green} 0${Font}) 退出脚本"
     echo ""
     read -r -p "$(echo -e "${PROMPT} 请输入编号: ")" selection
@@ -369,6 +372,7 @@ function select_containers() {
     fi
 
     local need_mirror=0
+    local need_upgrade=0
     if [ "$selection" = "all" ]; then
         for item in "${CONTAINER_LIST[@]}"; do
             SELECTED+=("${item%%|*}")
@@ -377,11 +381,18 @@ function select_containers() {
         for num in $selection; do
             if [ "$num" = "$mirror_opt" ]; then
                 need_mirror=1
+            elif [ "$num" = "$upgrade_opt" ]; then
+                need_upgrade=1
             elif [ "$num" -ge 1 ] 2>/dev/null && [ "$num" -le "${#CONTAINER_LIST[@]}" ]; then
                 local item="${CONTAINER_LIST[$((num - 1))]}"
                 SELECTED+=("${item%%|*}")
             fi
         done
+    fi
+
+    if [ "$need_upgrade" -eq 1 ]; then
+        upgrade_containers
+        return 1
     fi
 
     if [ "$need_mirror" -eq 1 ]; then
@@ -1027,13 +1038,234 @@ function deploy() {
 }
 
 # ——————————————————————————————————————————————————————————————————————————————————
+# 容器升级（数据无损）
+# ——————————————————————————————————————————————————————————————————————————————————
+function upgrade_containers() {
+    TITLE "容器升级（数据无损）"
+
+    local -a upg_keys=()
+    local -a upg_names=()
+    local -a upg_images=()
+
+    local idx=1
+    for item in "${CONTAINER_LIST[@]}"; do
+        local key="${item%%|*}"
+        if [ "${EXISTING_STATUS[$key]}" != "none" ] && [ -n "${EXISTING_STATUS[$key]}" ]; then
+            upg_keys+=("$key")
+            upg_names+=("${EXISTING_NAME[$key]}")
+            upg_images+=("${EXISTING_IMAGE[$key]}")
+            printf "  ${Green}%2d${Font}) %s -> %s\n" "$idx" "${EXISTING_NAME[$key]}" "${EXISTING_IMAGE[$key]}"
+            ((idx++))
+        fi
+    done
+
+    if [ ${#upg_keys[@]} -eq 0 ]; then
+        INFO "没有检测到已安装的容器"
+        press_enter
+        return
+    fi
+
+    echo ""
+    echo -e "  ${Green} 0${Font}) 返回主菜单"
+    echo ""
+
+    local selection
+    read -r -p "$(echo -e "${PROMPT} 请输入编号 (多个用空格分隔): ")" selection
+
+    [ -z "$selection" ] || [ "$selection" = "0" ] && return
+
+    local -a chosen_keys=()
+    for num in $selection; do
+        if [ "$num" -ge 1 ] 2>/dev/null && [ "$num" -le "${#upg_keys[@]}" ]; then
+            chosen_keys+=("${upg_keys[$((num - 1))]}")
+        fi
+    done
+
+    if [ ${#chosen_keys[@]} -eq 0 ]; then
+        ERROR "未选择任何有效容器"
+        press_enter
+        return
+    fi
+
+    echo ""
+    INFO "将要升级以下容器:"
+    for key in "${chosen_keys[@]}"; do
+        echo -e "  ${Green}${EXISTING_NAME[$key]}${Font} (${EXISTING_IMAGE[$key]})"
+    done
+    echo ""
+
+    if ! confirm "确认升级？数据不会丢失" "y"; then
+        INFO "已取消升级"
+        press_enter
+        return
+    fi
+
+    for key in "${chosen_keys[@]}"; do
+        local cname="${EXISTING_NAME[$key]}"
+        local cimage="${EXISTING_IMAGE[$key]}"
+
+        echo ""
+        INFO "升级容器: ${Green}${cname}${Font}"
+
+        INFO "  拉取最新镜像: $cimage"
+        docker pull "$cimage" || {
+            ERROR "  镜像拉取失败: $cimage"
+            continue
+        }
+
+        INFO "  提取容器配置..."
+        local inspect_data
+        inspect_data=$(docker inspect "$cname" 2>/dev/null)
+        [ -z "$inspect_data" ] && { ERROR "  无法读取容器配置"; continue; }
+
+        local -a run_args=(-d --name "$cname")
+
+        # Restart policy
+        local restart_policy
+        restart_policy=$(echo "$inspect_data" | python3 -c "
+import sys,json
+c=json.load(sys.stdin)[0]
+rp=c.get('HostConfig',{}).get('RestartPolicy',{})
+if rp.get('Name')=='always':
+    print('--restart always')
+elif rp.get('Name')=='unless-stopped':
+    print('--restart unless-stopped')
+elif rp.get('Name')=='on-failure':
+    print('--restart on-failure:'+str(rp.get('MaximumRetryCount',5)))
+else:
+    print('--restart unless-stopped')
+" 2>/dev/null)
+        [ -n "$restart_policy" ] && run_args+=($restart_policy)
+
+        # Network
+        local net_mode
+        net_mode=$(echo "$inspect_data" | python3 -c "
+import sys,json
+c=json.load(sys.stdin)[0]
+nm=c.get('HostConfig',{}).get('NetworkMode','default')
+if nm=='host':
+    print('--network host')
+else:
+    for nid,ncfg in c.get('NetworkSettings',{}).get('Networks',{}).items():
+        print(ncfg.get('NetworkID',''))
+" 2>/dev/null)
+
+        if echo "$net_mode" | grep -q "^--network host"; then
+            run_args+=($net_mode)
+        elif [ -n "$net_mode" ]; then
+            run_args+=(--network "$net_mode")
+        else
+            run_args+=(--network bridge)
+        fi
+
+        # Ports
+        local ports_str
+        ports_str=$(echo "$inspect_data" | python3 -c "
+import sys,json
+c=json.load(sys.stdin)[0]
+for p,v in c.get('NetworkSettings',{}).get('Ports',{}).items():
+    if v:
+        for h in v:
+            print(h.get('HostPort',''),end=' ')
+" 2>/dev/null)
+        if [ "$net_mode" != "--network host" ] && [ -n "$ports_str" ]; then
+            local ports_info
+            ports_info=$(echo "$inspect_data" | python3 -c "
+import sys,json
+c=json.load(sys.stdin)[0]
+for p,v in c.get('NetworkSettings',{}).get('Ports',{}).items():
+    if v:
+        port_num=p.split('/')[0]
+        for h in v:
+            print('-p '+h.get('HostPort','')+':'+port_num)
+" 2>/dev/null)
+            while IFS= read -r _pline; do
+                [ -n "$_pline" ] && run_args+=($_pline)
+            done <<< "$ports_info"
+        fi
+
+        # Mounts
+        local mounts
+        mounts=$(echo "$inspect_data" | python3 -c "
+import sys,json
+c=json.load(sys.stdin)[0]
+for m in c.get('Mounts',[]):
+    if m.get('Type')=='bind':
+        mode=m.get('Mode','rw')
+        print('-v '+m.get('Source','')+':'+m.get('Destination','')+(':'+mode if mode!='rw' else ''))
+" 2>/dev/null)
+        while IFS= read -r _mline; do
+            [ -n "$_mline" ] && run_args+=($_mline)
+        done <<< "$mounts"
+
+        # Env
+        local envs
+        envs=$(echo "$inspect_data" | python3 -c "
+import sys,json
+c=json.load(sys.stdin)[0]
+for e in c.get('Config',{}).get('Env',[]):
+    print('-e '+e)
+" 2>/dev/null)
+        while IFS= read -r _eline; do
+            [ -n "$_eline" ] && run_args+=($_eline)
+        done <<< "$envs"
+
+        # Devices
+        local devices
+        devices=$(echo "$inspect_data" | python3 -c "
+import sys,json
+c=json.load(sys.stdin)[0]
+for d in c.get('HostConfig',{}).get('Devices',[]):
+    print('--device '+d.get('PathOnHost','')+':'+d.get('PathInContainer',''))
+" 2>/dev/null)
+        while IFS= read -r _dline; do
+            [ -n "$_dline" ] && run_args+=($_dline)
+        done <<< "$devices"
+
+        # Privileged
+        local priv
+        priv=$(echo "$inspect_data" | python3 -c "
+import sys,json
+c=json.load(sys.stdin)[0]
+if c.get('HostConfig',{}).get('Privileged'):
+    print('1')
+" 2>/dev/null)
+        [ "$priv" = "1" ] && run_args+=(--privileged)
+
+        run_args+=("$cimage")
+
+        INFO "  停止容器: $cname"
+        docker stop "$cname" 2>/dev/null || true
+
+        INFO "  删除旧容器: $cname"
+        docker rm "$cname" 2>/dev/null || true
+
+        INFO "  重建容器: $cname"
+        docker run "${run_args[@]}"
+
+        local new_status
+        if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${cname}$"; then
+            INFO "  ${Green}${cname} 升级成功！${Font}"
+        else
+            ERROR "  ${cname} 升级后未运行，请检查 docker logs ${cname}"
+        fi
+    done
+
+    echo ""
+    INFO "升级完成！"
+    # 刷新容器状态
+    check_existing_containers
+    press_enter
+}
+
+# ——————————————————————————————————————————————————————————————————————————————————
 # 主流程
 # ——————————————————————————————————————————————————————————————————————————————————
 function main() {
     clear
     echo -e "${Bold}${Cyan}"
     echo "╔══════════════════════════════════════════════╗"
-    echo "║       媒体服务器 Docker 一键安装脚本          ║"
+    echo "║    媒体服务器 Docker 一键安装脚本 v2.01      ║"
     echo "║   qBittorrent / Transmission / iYUUPlus      ║"
     echo "║   MoviePilot / Vertex / Emby / Jellyfin / Plex ║"
     echo "╚══════════════════════════════════════════════╝"
