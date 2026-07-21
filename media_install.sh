@@ -1235,13 +1235,41 @@ if c.get('HostConfig',{}).get('Privileged'):
         run_args+=("$cimage")
 
         INFO "  停止容器: $cname"
-        docker stop "$cname" 2>/dev/null || true
+        docker stop -t 30 "$cname" 2>/dev/null || true
+        local wait_count=0
+        while docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${cname}$"; do
+            sleep 1
+            ((wait_count++))
+            [ "$wait_count" -ge 30 ] && break
+        done
 
         INFO "  删除旧容器: $cname"
         docker rm "$cname" 2>/dev/null || true
 
+        INFO "  等待端口释放..."
+        sleep 2
+
         INFO "  重建容器: $cname"
-        docker run "${run_args[@]}"
+        local retry=0
+        while [ "$retry" -lt 3 ]; do
+            if docker run "${run_args[@]}" 2>/tmp/docker_upgrade_err.$$; then
+                rm -f /tmp/docker_upgrade_err.$$
+                break
+            else
+                local err_msg
+                err_msg=$(cat /tmp/docker_upgrade_err.$$ 2>/dev/null)
+                rm -f /tmp/docker_upgrade_err.$$
+                if echo "$err_msg" | grep -qi "already in use"; then
+                    WARN "  端口冲突，等待释放后重试 ($((retry + 1))/3)..."
+                    sleep 3
+                    ((retry++))
+                else
+                    ERROR "  容器启动失败: $err_msg"
+                    ((retry=99))
+                    break
+                fi
+            fi
+        done
 
         local new_status
         if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${cname}$"; then
