@@ -1042,6 +1042,7 @@ function deploy() {
 # ——————————————————————————————————————————————————————————————————————————————————
 function upgrade_containers() {
     TITLE "容器升级（数据无损）"
+    INFO "正在检测各容器是否需要更新..."
 
     local -a upg_keys=()
     local -a upg_names=()
@@ -1050,17 +1051,39 @@ function upgrade_containers() {
     local idx=1
     for item in "${CONTAINER_LIST[@]}"; do
         local key="${item%%|*}"
-        if [ "${EXISTING_STATUS[$key]}" != "none" ] && [ -n "${EXISTING_STATUS[$key]}" ]; then
+        if [ "${EXISTING_STATUS[$key]}" = "none" ] || [ -z "${EXISTING_STATUS[$key]}" ]; then
+            continue
+        fi
+
+        local cname="${EXISTING_NAME[$key]}"
+        local cimage="${EXISTING_IMAGE[$key]}"
+
+        local old_id
+        old_id=$(docker image inspect --format '{{.ID}}' "$cimage" 2>/dev/null)
+
+        INFO "  检测 ${cname} (${cimage}) ..."
+        docker pull "$cimage" >/dev/null 2>&1 || {
+            WARN "  镜像拉取失败，跳过"
+            continue
+        }
+
+        local new_id
+        new_id=$(docker image inspect --format '{{.ID}}' "$cimage" 2>/dev/null)
+
+        if [ -n "$old_id" ] && [ -n "$new_id" ] && [ "$old_id" != "$new_id" ]; then
             upg_keys+=("$key")
-            upg_names+=("${EXISTING_NAME[$key]}")
-            upg_images+=("${EXISTING_IMAGE[$key]}")
-            printf "  ${Green}%2d${Font}) %s -> %s\n" "$idx" "${EXISTING_NAME[$key]}" "${EXISTING_IMAGE[$key]}"
+            upg_names+=("$cname")
+            upg_images+=("$cimage")
+            printf "  ${Green}%2d${Font}) %s  ${Yellow}(有更新)${Font}\n" "$idx" "$cname"
             ((idx++))
+        else
+            INFO "  ${cname} 已是最新版本"
         fi
     done
 
     if [ ${#upg_keys[@]} -eq 0 ]; then
-        INFO "没有检测到已安装的容器"
+        echo ""
+        INFO "所有容器均为最新版本，无需升级！"
         press_enter
         return
     fi
@@ -1106,12 +1129,6 @@ function upgrade_containers() {
 
         echo ""
         INFO "升级容器: ${Green}${cname}${Font}"
-
-        INFO "  拉取最新镜像: $cimage"
-        docker pull "$cimage" || {
-            ERROR "  镜像拉取失败: $cimage"
-            continue
-        }
 
         INFO "  提取容器配置..."
         local inspect_data
