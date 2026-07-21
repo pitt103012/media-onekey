@@ -3,4 +3,4 @@
 
 ## 一键安装
 复制下面整条命令到终端执行：
-bash -c "$(curl -fsSL https://raw.giteeusercontent.com/PITTgogogo/media-onekey/raw/main/install.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/pitt103012/media-onekey/main/install.sh)"
